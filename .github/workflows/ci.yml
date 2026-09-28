@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: agent-relay
+  KIND_CLUSTER: agent-relay
+  KIND_VERSION: v0.33.0
+
+jobs:
+  test:
+    name: Test (SQLite starter + PostgreSQL integration)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agent_relay
+          POSTGRES_USER: agent_relay
+          POSTGRES_PASSWORD: agent_relay
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_relay -d agent_relay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Run starter tests (SQLite)
+        run: uv run pytest test_agent_relay.py -v
+
+      - name: Run integration tests (PostgreSQL)
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@localhost:5433/agent_relay
+        run: uv run pytest test_agent_relay.py -v
+
+  build-and-deploy:
+    name: Build image and deploy to kind
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image tag
+        run: echo "IMAGE_TAG=${GITHUB_SHA:-local}-$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Build Docker image
+        run: docker build -t "${IMAGE_NAME}:${IMAGE_TAG}" .
+
+      - name: Install kind
+        run: |
+          if ! command -v kind >/dev/null 2>&1; then
+            curl -Lo ./kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+            chmod +x ./kind
+            sudo mv ./kind /usr/local/bin/kind
+          fi
+          kind version
+
+      - name: Install kubectl
+        run: |
+          if ! command -v kubectl >/dev/null 2>&1; then
+            KUBECTL_VERSION=$(curl -Ls https://dl.k8s.io/release/stable.txt)
+            curl -Lo ./kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+            chmod +x ./kubectl
+            sudo mv ./kubectl /usr/local/bin/kubectl
+          fi
+          kubectl version --client
+
+      - name: Ensure kind cluster exists and kubeconfig is loaded
+        run: |
+          if ! kind get clusters | grep -qx "${KIND_CLUSTER}"; then
+            kind create cluster --name "${KIND_CLUSTER}" --config k8s/kind-config.yaml
+          fi
+          kind export kubeconfig --name "${KIND_CLUSTER}"
+          kubectl cluster-info
+
+      - name: Load image into kind
+        run: kind load docker-image "${IMAGE_NAME}:${IMAGE_TAG}" --name "${KIND_CLUSTER}"
+
+      - name: Apply manifests
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply \
+            -f k8s/postgres-secret.yaml \
+            -f k8s/postgres-pvc.yaml \
+            -f k8s/postgres-deployment.yaml \
+            -f k8s/postgres-service.yaml \
+            -f k8s/app-deployment.yaml \
+            -f k8s/app-service.yaml
+
+      - name: Roll out new image
+        run: |
+          kubectl -n agent-relay set image deployment/agent-relay "agent-relay=${IMAGE_NAME}:${IMAGE_TAG}"
+          kubectl -n agent-relay rollout status deployment/postgres --timeout=120s
+          kubectl -n agent-relay rollout status deployment/agent-relay --timeout=120s
+
+      - name: Smoke test /ready
+        run: |
+          kubectl -n agent-relay run "ci-smoke-test-$(date +%s)" --rm -i --restart=Never \
+            --image=curlimages/curl:8.10.1 -- \
+            curl -sf http://agent-relay.agent-relay.svc.cluster.local:8000/ready

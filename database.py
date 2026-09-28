@@ -1,9 +1,13 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module is the only place that knows about the storage engine's
+connection details and writer-serialization strategy. The rest of the
+application talks to the models through :mod:`storage`. Two engines are
+supported: SQLite (a ``BEGIN IMMEDIATE`` writer reservation serializes the
+whole database) and PostgreSQL (an ordinary transaction plus row-level
+``SELECT ... FOR UPDATE`` / ``FOR UPDATE SKIP LOCKED`` locking at the call
+sites in :mod:`storage`, so unrelated tasks can be claimed concurrently). The
+HTTP protocol and delivery guarantees are identical either way.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generator
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select
+from sqlalchemy import DateTime, ForeignKey, Integer, Select, String, Text, UniqueConstraint, create_engine, event, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -175,21 +179,43 @@ def db_session() -> Generator[Session, None, None]:
         db.close()
 
 
+def is_sqlite(bind: Any) -> bool:
+    dialect = getattr(bind, "dialect", None)
+    return getattr(dialect, "name", None) == "sqlite"
+
+
+def for_update(query: Select, session: Session, *, skip_locked: bool = False) -> Select:
+    """Add row-level locking to ``query`` on engines that support it.
+
+    PostgreSQL locks the selected rows with ``FOR UPDATE`` (or ``FOR UPDATE
+    SKIP LOCKED`` for claim/recovery scans, so a locked row is simply skipped
+    rather than blocking the caller). SQLite has no ``FOR UPDATE``; its
+    ``BEGIN IMMEDIATE`` writer reservation already serializes the whole
+    transaction, so the query is returned unchanged.
+    """
+
+    if is_sqlite(session.get_bind()):
+        return query
+    return query.with_for_update(skip_locked=skip_locked)
+
+
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    SQLite: a ``BEGIN IMMEDIATE`` writer reservation serializes claims (and
+    recovery or terminal submissions) across API processes. PostgreSQL: an
+    ordinary transaction; callers use :func:`for_update` at the specific rows
+    they need to lock, so unrelated tasks are not blocked by each other.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if is_sqlite(connection):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        else:
+            connection.begin()
         yield session
         session.flush()
         connection.commit()
@@ -205,29 +231,40 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
+    candidate_task_ids = list(
         db.scalars(
-            select(Attempt)
+            select(Attempt.task_id)
             .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
             .order_by(Attempt.lease_expires_at, Attempt.id)
         )
     )
     count = 0
-    for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+    for task_id in candidate_task_ids:
+        task = db.scalar(for_update(select(Task).where(Task.id == task_id), db, skip_locked=True))
+        if task is None or task.status != "processing":
+            continue
+        attempt = db.scalar(
+            for_update(
+                select(Attempt).where(Attempt.task_id == task_id, Attempt.outcome == "processing"),
+                db,
+                skip_locked=True,
+            )
+        )
+        if attempt is None:
+            continue
+        lease_expires_at = db_time(attempt.lease_expires_at)
+        if lease_expires_at is None or lease_expires_at > now:
             continue
         attempt.outcome = "expired"
         attempt.finished_at = now_db
-        if task.status == "processing":
-            if task.attempt_count >= MAX_ATTEMPTS:
-                task.status = "failed"
-                task.error = "attempts_exhausted"
-                task.output = None
-                task.finished_at = now_db
-            else:
-                task.status = "queued"
-                task.finished_at = None
+        if task.attempt_count >= MAX_ATTEMPTS:
+            task.status = "failed"
+            task.error = "attempts_exhausted"
+            task.output = None
+            task.finished_at = now_db
+        else:
+            task.status = "queued"
+            task.finished_at = None
         count += 1
     return count
 
@@ -255,8 +292,10 @@ __all__ = [
     "db_session",
     "db_time",
     "engine",
+    "for_update",
     "immediate_transaction",
     "init_db",
+    "is_sqlite",
     "iso_time",
     "recover_expired",
     "recover_expired_in_session",

@@ -1,0 +1,9 @@
+.venv
+.git
+.vscode
+__pycache__/
+.pytest_cache/
+*.db
+*.db-shm
+*.db-wal
+*-credentials.json
